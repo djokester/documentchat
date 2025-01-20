@@ -14,3 +14,7 @@ class SQLQuery(BaseModel):
 
 class Explanation(BaseModel):
     explanation: str
+
+class Evaluation(BaseModel):
+    evaluation: bool
+    justification: str

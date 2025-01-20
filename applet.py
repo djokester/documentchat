@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
 from io import StringIO
-from groq import Groq
 from visualization import potential_data_visualisation
 from data_extraction_openai import get_data
 from data_correction import convert_string_columns
 from explanation import get_explanation
+from llmasajudge import get_evaluation
 import duckdb
 import os
 from openai import OpenAI
@@ -64,9 +64,13 @@ def main():
             st.write(data)
             st.write(get_explanation(user_query, st.session_state.metadata, client, data).explanation)
             
+            
             if visualisation is not None:
                 visualisation_figure = get_data_visualisation(data, visualisation, client, st)
                 st.plotly_chart(visualisation_figure)
+
+            import pdb; pdb.set_trace()
+            st.write(get_evaluation(user_query, st.session_state.metadata, client, data).explanation)
         else:
             st.write("Please upload a file and ask a question.")
 
