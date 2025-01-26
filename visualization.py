@@ -1,6 +1,22 @@
 from models import ChartFlag, ChartType
 import json
-def potential_data_visualisation(user_input, metadata, client):
+
+def create_metadata(df):
+    return df.head().to_string()
+
+def potential_data_visualisation(user_input, session_state, forecasting, client ):
+    """
+    Determines if a data visualization is necessary and identifies the best visualization type.
+
+    Parameters:
+    - user_input: The user's prompt for the visualization.
+    - session_state: An object containing the state, including dataframes and metadata.
+    - client: The OpenAI client for generating queries.
+    - forecasting: A boolean indicating if forecasting-related data is included.
+
+    Returns:
+    - A ChartType object containing the type, method, and description of the visualization if needed.
+    """
     chart_types = [{'Type': 'Scatter',
   'Method': 'scatter',
   'Description': 'In a scatter plot, each row of data_frame is represented by a symbol mark in 2D space.'},
@@ -106,94 +122,108 @@ def potential_data_visualisation(user_input, metadata, client):
   'Description': 'In a ternary scatter plot, each row of data_frame is represented by a symbol mark in ternary coordinates.'},
  {'Type': 'Line Ternary',
   'Method': 'line_ternary',
-  'Description': 'In a ternary line plot, each row of data_frame is represented as vertex of a polyline mark in ternary coordinates.'}]
+  'Description': 'In a ternary line plot, each row of data_frame is represented as vertex of a polyline mark in ternary coordinates.'}]# Keep the existing chart_types definition here
 
+    # Generate metadata based on the forecasting flag
+    if forecasting:
+        metadata_df = create_metadata(session_state.df)
+        metadata_forecast_df = create_metadata(session_state.forecast_df)
+        retrieved_context = (
+            f"Main DataFrame Metadata:\n{metadata_df}\n\n"
+            f"Forecast DataFrame Metadata:\n{metadata_forecast_df}"
+        )
+        dataframes_description = (
+            "'dataframe' represents the main dataset, while 'forecast_dataframe' represents forecasted data."
+        )
+    else:
+        metadata_df = create_metadata(session_state.df)
+        retrieved_context = f"Main DataFrame Metadata:\n{metadata_df}"
+        dataframes_description = "'dataframe' represents the main dataset."
+
+    # First system prompt to determine if visualization is necessary
     flag_format = "{\"visualisation_necessary\": flag}"
-    system_prompt =     (
-                f"Given the prompt: `{user_input}` and the head of a dataframe below, can you determine if the response can be best represented in the form of a data visualization. "
-                "The decision should be based on whether the question inherently requires a comparative or analytical response that would benefit from a visual representation, not just the availability of data. "
-                f"Your response needs to be in a JSON format: {flag_format}. `visualisation_necessary` represents whether a data visualization is necessary or not with a boolean flag. "
-                "True means that a visualisation is absolutely necessary otherwise visualisation_necessary should be marked False."
-                "The dataframe's head below is just to represent the nature of data available but that should be immaterial to whether there is a need for data visualization or not."
+    system_prompt = (
+        f"Given the prompt: `{user_input}` and the metadata below, can you determine if the response can be best represented in the form of a data visualization? "
+        "The decision should be based on whether the question inherently requires a comparative or analytical response that would benefit from a visual representation, "
+        "not just the availability of data. "
+        f"Your response needs to be in a JSON format: {flag_format}. `visualisation_necessary` represents whether a data visualization is necessary or not with a boolean flag. "
+        f"{dataframes_description}."
     )
 
-    chat_completion = client.chat.completions.create (
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Prompt: `{user_input}` \n Retrieved Context: `{metadata}`"}
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {
-            "name": "visualisation_flag",
-            "strict": True,
-            "schema": {
-                "type": "object",
-                "properties": {
-                "visualisation_necessary": {
-                    "type": "boolean",
-                    "description": "Indicates whether visualisation is necessary or not."
-                }
-                },
-                "required": [
-                "visualisation_necessary"
-                ],
-                "additionalProperties": False
-            }
-            }
-        },
-        temperature=0,
-        max_completion_tokens=2048,
-        top_p=1,
-        frequency_penalty=0,
-        presence_penalty=0
-    )
     try:
+        # First query to check if visualization is necessary
+        chat_completion = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Prompt: `{user_input}` \n Retrieved Context: `{retrieved_context}`"}
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "visualisation_flag",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "visualisation_necessary": {
+                                "type": "boolean",
+                                "description": "Indicates whether visualization is necessary or not."
+                            }
+                        },
+                        "required": ["visualisation_necessary"],
+                        "additionalProperties": False
+                    }
+                }
+            },
+            temperature=0,
+            max_completion_tokens=2048,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
+
         print(chat_completion.choices[0].message.content)
         if ChartFlag.model_validate_json(chat_completion.choices[0].message.content).visualisation_necessary:
+            # Visualization is necessary; determine the type
             visualisation_format = "{\"Type\": chart_type, \"Method\": function(), \"Description\": description}"
             system_prompt = (
-                f"Given the prompt: `{user_input}` and the head of the dataframe below, can you determine how the response can be best represented in the form of a data visualization. "
+                f"Given the prompt: `{user_input}` and the metadata below, determine the best type of data visualization. "
                 f"The JSON format: {visualisation_format}. \n"
-                f"The list of choices for the responses are available in {json.dumps(chart_types)}. It provides the types of chart available, corresponding methods and their description. Return the choice JSON which is most suitable. "
+                f"The list of choices for the responses are available in {json.dumps(chart_types)}. It provides the types of charts available, their corresponding methods, and descriptions. "
+                f"Return the choice JSON which is most suitable. {dataframes_description}."
             )
 
             chat_completion = client.chat.completions.create(
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Prompt: `{user_input}` \n DataFrame Head: `{metadata}`"}
+                    {"role": "user", "content": f"Prompt: `{user_input}` \n Retrieved Context: `{retrieved_context}`"}
                 ],
-
                 model="gpt-4o",
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
-                    "name": "visualisation_format",
-                    "strict": True,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                        "Type": {
-                            "type": "string",
-                            "description": "The type of chart, such as bar, line, pie, etc."
-                        },
-                        "Method": {
-                            "type": "string",
-                            "description": "A method or function that pertains to the visualization."
-                        },
-                        "Description": {
-                            "type": "string",
-                            "description": "A description of the visualization and its purpose."
+                        "name": "visualisation_format",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "Type": {
+                                    "type": "string",
+                                    "description": "The type of chart, such as bar, line, pie, etc."
+                                },
+                                "Method": {
+                                    "type": "string",
+                                    "description": "A method or function that pertains to the visualization."
+                                },
+                                "Description": {
+                                    "type": "string",
+                                    "description": "A description of the visualization and its purpose."
+                                }
+                            },
+                            "required": ["Type", "Method", "Description"],
+                            "additionalProperties": False
                         }
-                        },
-                        "required": [
-                        "Type",
-                        "Method",
-                        "Description"
-                        ],
-                        "additionalProperties": False
-                    }
                     }
                 },
                 temperature=0,
@@ -201,10 +231,11 @@ def potential_data_visualisation(user_input, metadata, client):
                 top_p=1,
                 frequency_penalty=0,
                 presence_penalty=0
-
             )
+            print(chat_completion.choices[0].message.content)
             return ChartType.model_validate_json(chat_completion.choices[0].message.content)
         else:
             return None
     except Exception as e:
-       print(e)
+        print(e)
+        return None

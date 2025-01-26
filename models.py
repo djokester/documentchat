@@ -4,6 +4,12 @@ from typing import Literal
 class ChartFlag(BaseModel):
     visualisation_necessary: bool
 
+class ForecastFlag(BaseModel):
+    forecasting_possible: bool
+
+class ForecastRequestFlag(BaseModel):
+    forecast_request: bool
+
 class ChartType(BaseModel):
     Type: str
     Method: str

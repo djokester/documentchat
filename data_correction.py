@@ -1,19 +1,127 @@
 import pandas as pd
 import json
 
-def convert_string_columns(df: pd.DataFrame, threshold: float = 0.8) -> pd.DataFrame:
+def get_datetime_columns(metadata, client):
+    """
+    Determines which columns in a dataframe should be of type datetime
+    and returns a dictionary with the column names as keys and their respective datetime formats as values.
+
+    Parameters:
+    - dataframe (pd.DataFrame): The input dataframe.
+    - client: The OpenAI client object.
+
+    Returns:
+    - dict: A dictionary where keys are column names and values are the inferred datetime formats.
+    """
+    # Extract metadata: column names and their first few non-null values    
+    # OpenAI system prompt
+    system_prompt = (
+        "Given the metadata of a dataframe (column names and their sample values), identify which columns "
+        "are most likely to represent datetime data like time, date, day, month and year and the strftime format codes of the datetime values. "
+        "Return the result in JSON format as follows: "
+        "{\"datetime_columns\": [{\"column_name\": \"datetime_format\"}}, {\"column_name\": \"datetime_format\"}}]"
+        "where 'datetime_format' is the strftime format codes for parsing the datetime values in the column."
+    )
+
+    # Call the OpenAI client
+    try:
+        chat_completion = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Metadata: {metadata}"}
+            ],
+            response_format=
+            {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "datetime_columns",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                    "columns": {
+                        "type": "array",
+                        "description": "A collection of columns  most likely to represent datetime data defined by their name and format.",
+                        "items": {
+                        "type": "object",
+                        "properties": {
+                            "column_name": {
+                            "type": "string",
+                            "description": "The name of the datetime column."
+                            },
+                            "datetime_format": {
+                            "type": "string",
+                            "description": "The  strftime format codes of the datetime for this column."
+                            }
+                        },
+                        "required": [
+                            "column_name",
+                            "datetime_format"
+                        ],
+                        "additionalProperties": False
+                        }
+                    }
+                    },
+                    "required": [
+                    "columns"
+                    ],
+                    "additionalProperties": False
+                },
+                "strict": True
+                }
+        },
+                
+                    
+            temperature=0,
+            max_completion_tokens=2048,
+            top_p=1,
+            frequency_penalty=0,
+            presence_penalty=0
+        )
+        
+        result = json.loads(chat_completion.choices[0].message.content)
+        print(result)
+        
+        # Parse and return the dictionary of datetime columns with formats
+        return result["columns"]
+
+    except Exception as e:
+        print(f"Error processing the response: {e}")
+        return {}
+
+
+def convert_string_columns(
+    df: pd.DataFrame, 
+    datetime_columns: list = None,
+    threshold: float = 0.8, 
+) -> pd.DataFrame:
     """
     Converts string columns in a DataFrame to the most appropriate type 
-    (int, float, datetime, bool, or valid JSON strings).
+    (int, float, datetime, bool, or valid JSON strings), with the ability 
+    to specify columns to be directly treated as datetime.
     
     Parameters:
     - df: pd.DataFrame - The input DataFrame with all columns as strings.
     - threshold: float - The minimum proportion of valid conversions required to change a column's type.
+    - datetime_columns: list - List of column names to be directly converted to datetime.
     
     Returns:
     - pd.DataFrame - The DataFrame with converted columns.
     """
-    for column in df.select_dtypes(include='object').columns:
+    datetime_columns = datetime_columns or []
+    print(datetime_columns)
+    for column in df.columns:
+        # Directly convert specified datetime columns
+        datetime_column_names = [item["column_name"] for item in datetime_columns]
+        datetime_columns_dict = {item["column_name"]: item["datetime_format"] for item in datetime_columns}
+        if column in datetime_column_names:
+            try:
+                df[column] = pd.to_datetime(df[column], errors='coerce', format=datetime_columns_dict[column])
+                print(f"Column {column} directly converted to datetime")
+            except Exception as e:
+                print(f"Column {column} could not be converted to datetime: {e}")
+            continue  # Skip further checks for this column
+        
         conversion_success = {}
         
         # Attempt integer conversion
@@ -31,14 +139,6 @@ def convert_string_columns(df: pd.DataFrame, threshold: float = 0.8) -> pd.DataF
             conversion_success['float'] = (success_rate, temp)
         except Exception:
             conversion_success['float'] = (0, None)
-        
-        # Attempt datetime conversion
-        try:
-            temp = pd.to_datetime(df[column], errors='coerce')
-            success_rate = temp.notna().mean()
-            conversion_success['datetime'] = (success_rate, temp)
-        except Exception:
-            conversion_success['datetime'] = (0, None)
         
         # Attempt boolean conversion
         try:
