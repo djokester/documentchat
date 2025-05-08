@@ -18,6 +18,10 @@ def get_datetime_columns(metadata, client):
     system_prompt = (
         "Given the metadata of a dataframe (column names and their sample values), identify which columns "
         "are most likely to represent datetime data like time, date, day, month and year and the strftime format codes of the datetime values. "
+        "A column qualifies as datetime only if ≥ 80 % of its non-null sample values"
+        "• contain at least one digit, and  "
+        "• can be parsed by Python’s strptime using the format you output"
+        "Ignore numeric IDs or counts even if they have six digits."
         "Return the result in JSON format as follows: "
         "{\"datetime_columns\": [{\"column_name\": \"datetime_format\"}}, {\"column_name\": \"datetime_format\"}}]"
         "where 'datetime_format' is the strftime format codes for parsing the datetime values in the column."
