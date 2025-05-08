@@ -1,6 +1,57 @@
 from models import ForecastFlag, ForecastRequestFlag
 import json
 import pandas as pd
+from collections import deque
+import tiktoken  
+import time
+from stqdm import stqdm
+
+enc = tiktoken.encoding_for_model("gpt-4o")
+
+def tokens_in_text(txt: str) -> int:
+    return len(enc.encode(txt))
+
+def tokens_in_messages(messages) -> int:
+    """Count GPT token cost for a list-of-dict messages."""
+    # gpt-4o uses the standard chat format cost formula (© OpenAI docs)
+    TOK_PER_MSG  = 3
+    TOK_PER_NAME = 1
+    total = 0
+    for m in messages:
+        total += TOK_PER_MSG
+        for k, v in m.items():
+            total += tokens_in_text(v)
+            if k == "name":
+                total += TOK_PER_NAME
+    total += 3  #  every reply primed with <|assistant|>
+    return total
+
+# ─────────────────────────────────────────────────────────────────────────
+# 2)  rolling 60‑s token counter (“token bucket”)
+# ─────────────────────────────────────────────────────────────────────────
+TPM_LIMIT = 30_000                  # gpt‑4o org‑wide default
+history: deque[tuple[float, int]] = deque()   # (ts, n_tokens)
+
+def tokens_last_minute() -> int:
+    """Return tokens in the previous 60 s; purge stale records."""
+    now = time.time()
+    while history and history[0][0] < now - 60:
+        history.popleft()
+    return sum(t for _, t in history)
+
+def wait_for_quota(tokens_needed: int):
+    """Sleep precisely until `tokens_needed` will fit into the bucket."""
+    while tokens_last_minute() + tokens_needed > TPM_LIMIT:
+        head_ts, _ = history[0]
+        sleep_for = (head_ts + 60) - time.time() + 0.05  # +ε safety
+        if sleep_for > 0:
+            time.sleep(sleep_for)
+        else:                                            # should rarely hit
+            break
+
+def log_tokens(n: int):
+    history.append((time.time(), n))
+
 
 def is_forecast_request(prompt, client):
     """
@@ -177,125 +228,176 @@ def identify_timeseries_datetime_column(metadata, client):
         return None
 
 
-def iterative_forecasting(df, datetime_column, client):
+# ─────────────────────────────────────────────────────────────────────────
+#  NEW  — helper to detect seasonality with GPT‑4o
+# ─────────────────────────────────────────────────────────────────────────
+def detect_seasonality(df, datetime_column, client, max_rows: int = 200):
     """
-    Iteratively forecasts and stores results in a DataFrame.
+    Ask GPT‑4o to infer the dominant season length (in rows).
 
-    Parameters:
-        df (pd.DataFrame): The input DataFrame containing the time series data.
-        datetime_column (str): The name of the datetime column.
-        client: The OpenAI client instance.
-
-    Returns:
-        pd.DataFrame: A DataFrame containing the forecasted results for each step.
+    Returns
+    -------
+    int  – positive integer ≥ 1
     """
-    # Ensure the DataFrame is sorted by the datetime column
-    df[datetime_column] = pd.to_datetime(df[datetime_column])
-    df.sort_values(by=datetime_column, inplace=True)
+    sample = df[[datetime_column]].head(max_rows).to_json(orient="records")
 
-    # Calculate the time difference between the last two timestamps
-    df.reset_index(drop=True, inplace=True)
-    time_diff = df[datetime_column].iloc[-1] - df[datetime_column].iloc[-2]
+    system_prompt = (
+        "You are an expert time‑series analyst. The user will give you a list "
+        "of timestamped rows from a dataset.  Infer the dominant seasonality "
+        "*in number of rows* (e.g. hourly data with daily cycle → 24). "
+        "Respond ONLY in JSON:\n"
+        '{ "season_length": <positive integer> }'
+    )
 
-    # Initialize a list to store forecasted results
-    forecasts = []
-
-    # Iteratively forecast
-    for i in range(2, len(df) + 1):
-        # Subset the DataFrame up to the current row
-        subset = df.iloc[:i]
-        
-        # Define the target timestamp for the prediction
-        if i == len(df):
-            target_timestamp = df[datetime_column].iloc[-1] + time_diff
-        else:
-            target_timestamp = df[datetime_column].iloc[i]
-
-        # Call the forecasting function
-        try:
-            forecast = get_forecast(subset, target_timestamp, datetime_column, client)
-            forecast["forecast_time"] = target_timestamp
-            forecasts.append(forecast)
-        except Exception as e:
-            print(f"Error during forecasting for timestamp {target_timestamp}: {e}")
-            continue
-
-    # Combine all forecasts into a single DataFrame
-    print(forecasts)
-    forecast_df = pd.concat(forecasts, ignore_index=True)
-    return forecast_df
-
-
-def get_forecast(df, timestamp,datetime_column, client):
-    response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=[
-        {
-        "role": "system",
-        "content": [
-            {
-            "type": "text",
-            "text": f"Given the dataframe please provide the forecast for {timestamp} in the format proviided. Use forecast_time for the forecast timestamp and drop  {datetime_column}"
-            }
-        ]
-        },
-        {
-        "role": "user",
-        "content": [
-            {
-            "type": "text",
-            "text": df.to_json()
-            }
-        ]
-        },
-    ],
-    response_format={
-        "type": "json_schema",
-        "json_schema": {
-        "name": "dataframe",
-        "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-            "data": {
-                "type": "array",
-                "description": "An array of objects representing rows in the dataframe.",
-                "items": {
-                "type": "object",
-                "properties": {
-                    "column_name": {
-                    "type": "string",
-                    "description": "The name of the column."
+    resp = client.chat.completions.create(
+        model="gpt-4o",
+        temperature=0,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": sample}
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "seasonality_schema",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "season_length": {  # ← only the allowed keywords
+                            "type": "integer",
+                            "description": "Dominant season length in rows"
+                        }
                     },
-                    "value": {
-                    "type": "string",
-                    "description": "The value corresponding to the column name."
-                    }
-                },
-                "required": [
-                    "column_name",
-                    "value"
-                ],
-                "additionalProperties": False
+                    "required": ["season_length"],
+                    "additionalProperties": False
                 }
             }
-            },
-            "required": [
-            "data"
-            ],
-            "additionalProperties": False
-        }
-        }
-    },
-    temperature=1,
-    max_completion_tokens=2048,
-    top_p=1,
-    frequency_penalty=0,
-    presence_penalty=0
+        },
     )
-    data = json.loads(response.choices[0].message.content)
-    df = pd.DataFrame(data["data"])
-    df_pivoted = df.set_index('column_name').T
-    df_pivoted.reset_index(drop=True, inplace=True)
-    return df_pivoted
 
+    season_len = int(json.loads(resp.choices[0].message.content)["season_length"])
+    return max(1, season_len)           # final sanity‑check in Python
+
+# ─────────────────────────────────────────────────────────────────────────
+#  UPDATED  — iterative_forecasting uses the season length
+# ─────────────────────────────────────────────────────────────────────────
+def iterative_forecasting(df, datetime_column, client):
+    df = df.sort_values(datetime_column).reset_index(drop=True)
+    df[datetime_column] = pd.to_datetime(df[datetime_column])
+
+    # 1)  Ask GPT‑4o for the season length
+    try:
+        season_len = detect_seasonality(df, datetime_column, client)
+    except Exception as err:
+        print(f"⚠️  Seasonality detection failed: {err}.  Using default=48.")
+        season_len = 48
+
+    # 2)  Calculate the lead time (step) for the *next* timestamp
+    step = df[datetime_column].iloc[-1] - df[datetime_column].iloc[-2]
+
+    forecasts = []
+    hop = season_len  * 2                     # hop size and window size are the same
+    n_iters = (len(df) - 1 + hop - 1) // hop    # ceil division for tqdm bar
+    original_cols = [c for c in df.columns if c != datetime_column]
+
+    for end in stqdm(range(hop, len(df) + 1, hop),
+                     total=n_iters,
+                     desc=f"Forecasting (window={season_len})"):
+        subset = df.iloc[:end]
+        ts = (df[datetime_column].iloc[-1] + step
+              if end >= len(df) else df[datetime_column].iloc[end])
+
+        try:
+            fc = chat_with_backpressure(subset,
+                                         ts,
+                                         datetime_column,
+                                         client,
+                                         original_cols,
+                                         base_window=season_len)
+            forecasts.append(fc)
+        except Exception as err:
+            print(f"⚠️  Forecast failed for {ts}: {err}")
+
+    if not forecasts:
+        raise RuntimeError("No forecasts were produced.")
+
+    return pd.concat(forecasts, ignore_index=True)
+
+# ─────────────────────────────────────────────────────────────────────────
+#  chat_with_backpressure stays exactly as in your previous version.
+#  (Its `base_window` is now driven by season_len from detect_seasonality.)
+# ─────────────────────────────────────────────────────────────────────────
+
+
+
+def chat_with_backpressure(df,
+                           timestamp,
+                           datetime_column,
+                           client,
+                           original_cols,
+                           base_window: int = 48):
+    """
+    Forecast a single timestamp with strict column enforcement and
+    rate‑limit safety.
+    """
+    # 0)  Build the column‑specific JSON schema once
+    col_props = {c: {"type": "number"} for c in original_cols}
+    col_props["forecast_time"] = {"type": "string"}       # ISO 8601
+    row_schema = {
+        "type": "object",
+        "properties": col_props,
+        "required": list(col_props.keys()),               # ALL columns required
+        "additionalProperties": False
+    }
+    response_schema = {
+        "name": "single_forecast_row",
+        "strict": True,
+        "schema": row_schema
+    }
+
+    window = base_window
+    while True:
+        df_slice = df.tail(window)
+        payload_json = df_slice.to_json()
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    f"Predict the next time {base_window*2} step for **all** numeric columns "
+                    f"exactly as named here: {', '.join(original_cols)}.\n"
+                    "Return a single JSON object with those keys **plus** "
+                    f"'forecast_time' equal to {timestamp.isoformat()}.\n"
+                    "Do NOT rename, pluralise or add suffixes."
+                )
+            },
+            {"role": "user", "content": payload_json}
+        ]
+
+        n_tokens_in = tokens_in_messages(messages)
+        estimated_out = 200                     # much smaller now
+        tokens_total = n_tokens_in + estimated_out
+
+        if tokens_total > TPM_LIMIT:
+            if window == 1:
+                raise ValueError("Even a 1‑row payload exceeds token limit.")
+            window = max(1, window // 2)
+            continue
+
+        wait_for_quota(tokens_total)            # rate‑limit throttle
+
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=messages,
+            temperature=0,
+            response_format={"type": "json_schema",
+                             "json_schema": response_schema},
+            max_completion_tokens=estimated_out,
+        )
+
+        log_tokens(n_tokens_in +
+                   tokens_in_text(resp.choices[0].message.content))
+
+        row = json.loads(resp.choices[0].message.content)
+        return pd.DataFrame([row])              # already tidy

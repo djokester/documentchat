@@ -8,3 +8,4 @@ groqeval==0.1.0
 duckdb==1.0.0
 beautifulsoup4==4.12.3
 plotly==5.22.0
+stqdm==0.0.5

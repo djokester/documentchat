@@ -15,126 +15,137 @@ def clean_query(text: str) -> str:
     clean_text = re.sub(r"```", "", clean_text.strip())
     return clean_text.strip()
 
-def get_data(viz, user_input, session_state, forecasting, client, connectdf):
+def get_data(viz, user_input, session_state, client, connectdf):
     """
-    Generates and executes an SQL query for a data visualization with up to three retries.
+    Generates and executes an SQL query (DuckDB) for the requested visualisation.
+    Automatically detects whether a forecast table is available by reading
+    `session_state.forecast` (True/False).
 
-    Parameters:
-    - viz: The type of visualization requested.
-    - user_input: The user's prompt for the visualization.
-    - session_state: An object containing the state, including dataframes and metadata.
-    - client: The OpenAI client for generating queries.
-    - connectdf: A database connection object supporting execute().
-    - forecasting: A boolean indicating if forecasting-related data is included.
+    Parameters
+    ----------
+    viz : str
+        Visualisation type requested by the user.
+    user_input : str
+        Free‑form user prompt.
+    session_state : streamlit.session_state
+        Holds df / forecast_df / forecast flag.
+    client : OpenAI
+        OpenAI client used to draft the SQL.
+    connectdf : duckdb.DuckDBPyConnection
+        Connection on which the query will be executed.
 
-    Returns:
-    - A DataFrame containing the query result.
+    Returns
+    -------
+    pandas.DataFrame
+        Result of the generated SQL query.
     """
-    # Create metadata based on the forecasting flag
+    # 1) Detect whether forecasting is in play
+    forecasting = bool(getattr(session_state, "forecast", False))
+
+    # 2) Build metadata and system prompt accordingly
     if forecasting:
-        metadata_df = create_metadata(session_state.df)
-        metadata_forecast_df = create_metadata(session_state.forecast_df)
+        md_main = create_metadata(session_state.df)
+        md_fore = create_metadata(session_state.forecast_df)
         retrieved_context = (
-            f"Main DataFrame Metadata:\n{metadata_df}\n\n"
-            f"Forecast DataFrame Metadata:\n{metadata_forecast_df}"
+            f"Main DataFrame Metadata:\n{md_main}\n\n"
+            f"Forecast DataFrame Metadata:\n{md_fore}"
         )
-        table_names = "Table Names: 'dataframe' (main dataset), 'forecast_dataframe' (forecasted data)"
+        table_names = (
+            "Table names: 'dataframe' (main dataset) and 'forecast_dataframe' "
+            "(forecasted data)."
+        )
         system_prompt = (
-            "Given the prompt, the metadata of two dataframes below, and the form of a data visualization, "
-            "can you write an SQL query that joins or uses both dataframes to produce the data required for visualization? "
-            "'dataframe' represents the main dataset, while 'forecast_dataframe' represents data derived from forecasting. "
-            "Your response should be a valid DuckDB SQL query. Avoid any backtick formatting. "
-            "Please ensure the query is executable and returns the desired output for visualization."
+            "Given the prompt, the metadata of two dataframes below, and the "
+            "desired form of a data visualisation, write a DuckDB‑compatible "
+            "SQL query that returns the data needed. Use 'dataframe' for the "
+            "main data and 'forecast_dataframe' for the forecast. "
+            "Return *only* the query—no backticks, no commentary."
         )
     else:
-        metadata_df = create_metadata(session_state.df)
-        retrieved_context = f"Main DataFrame Metadata:\n{metadata_df}"
-        table_names = "Table Name: 'dataframe'"
+        md_main = create_metadata(session_state.df)
+        retrieved_context = f"Main DataFrame Metadata:\n{md_main}"
+        table_names = "Table name: 'dataframe'."
         system_prompt = (
-            "Given the prompt, the metadata of a dataframe below, and the form of a data visualization, "
-            "can you write an SQL query for the dataframe that would return the data needed for visualization? "
-            "Your response should be a valid DuckDB SQL query. Avoid any backtick formatting. "
-            "Please ensure the query is executable and returns the desired output for visualization."
+            "Given the prompt, the dataframe metadata below, and the desired "
+            "visualisation, write a DuckDB‑compatible SQL query that returns "
+            "the needed data. Return *only* the query—no backticks, no commentary."
         )
 
-    attempt_count = 0
-    previous_responses = []
-    previous_errors = []
+    # 3) Retry loop (max 5)
+    attempts, prior_sql, prior_err = 0, [], []
 
-    while attempt_count < 5:
-        attempt_count += 1
-        try:
-            # Initial message setup
-            if attempt_count == 1:
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Data Visualization: {viz}\nPrompt: `{user_input}`\nRetrieved Context: `{retrieved_context}`\n{table_names}"
-                        ),
-                    },
-                ]
-            else:
-                # On subsequent retries, include all previous attempts and errors
-                assistant_history = "\n\n".join(
-                    [f"Attempt {i+1} Response:\n{response}" for i, response in enumerate(previous_responses)]
-                )
-                error_history = "\n\n".join(
-                    [f"Attempt {i+1} Error:\n{error}" for i, error in enumerate(previous_errors)]
-                )
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Data Visualization: {viz}\nPrompt: `{user_input}`\nRetrieved Context: `{retrieved_context}`\n{table_names}\n"
-                            f"Previous Responses:\n{assistant_history}\n\n"
-                            f"Errors Encountered:\n{error_history}\n\n"
-                            f"Please correct the query and return a valid SQL query supported by DuckDB."
-                        ),
-                    },
-                ]
+    while attempts < 5:
+        attempts += 1
 
-            print(f"ATTEMPT {attempt_count}")
+        # Assemble messages
+        if attempts == 1:
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Visualisation: {viz}\n"
+                        f"Prompt: {user_input}\n"
+                        f"{retrieved_context}\n"
+                        f"{table_names}"
+                    ),
+                },
+            ]
+        else:
+            msg_prev = "\n\n".join(
+                f"Attempt {i+1} SQL:\n{sql}" for i, sql in enumerate(prior_sql)
+            )
+            msg_err = "\n\n".join(
+                f"Attempt {i+1} Error:\n{err}" for i, err in enumerate(prior_err)
+            )
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Visualisation: {viz}\n"
+                        f"Prompt: {user_input}\n"
+                        f"{retrieved_context}\n"
+                        f"{table_names}\n\n"
+                        f"Previous attempts:\n{msg_prev}\n\n"
+                        f"Errors:\n{msg_err}\n\n"
+                        "Please fix the query."
+                    ),
+                },
+            ]
 
-            # Generate SQL query using GPT-4
-            chat_completion = client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                temperature=0,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "sql_query_schema",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
+        # Call the model
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            temperature=0,
+            messages=messages,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "sql_query_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
                             "query": {
                                 "type": "string",
-                                "description": "The SQL query string used to retrieve or manipulate data."
+                                "description": "DuckDB SQL query.",
                             }
-                            },
-                            "required": [
-                            "query"
-                            ],
-                            "additionalProperties": False
                         },
-                        "strict": True
-                        }
-                                        },
-            )
-            sql_query = clean_query(json.loads(chat_completion.choices[0].message.content)["query"])
-            print(f"Generated Query (Attempt {attempt_count}):\n{sql_query}")
-            previous_responses.append(sql_query)
+                        "required": ["query"],
+                        "additionalProperties": False,
+                    },
+                    "strict": True,
+                },
+            },
+        )
 
-            # Execute the query
+        sql_query = clean_query(json.loads(resp.choices[0].message.content)["query"])
+        prior_sql.append(sql_query)
+
+        try:
             return connectdf.execute(sql_query).fetchdf()
-
         except Exception as e:
-            print(f"Error (Attempt {attempt_count}): {str(e)}")
-            previous_errors.append(str(e))
+            prior_err.append(str(e))
+            if attempts >= 5:
+                raise RuntimeError(f"Failed after 5 attempts: {e}")
 
-            if attempt_count == 3:
-                print("Maximum retries reached.")
-                raise Exception(f"Final Exception: {str(e)}")
